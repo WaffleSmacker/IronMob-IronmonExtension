@@ -143,7 +143,7 @@ local function IronMobBridge()
 	self.name = "IronMob Bridge"
 	self.author = "WaffleSmacker"
 	self.description = "Chat vs Streamer bridge for IronMob. Click Options to launch the Bridge application."
-	self.version = "1.01"
+	self.version = "1.4"
 	self.github = "WaffleSmacker/IronMob-IronmonExtension"
 	self.url = string.format("https://github.com/%s", self.github)
 
@@ -1159,6 +1159,322 @@ local function IronMobBridge()
 		return isUpdateAvailable, downloadUrl
 	end
 
+	-- ===================== FIRST-TIME SETUP (ROM patch + Tracker profile) =====================
+	-- One-time onboarding: patch the player's own clean FireRed (USA) into the IronMob base ROM
+	-- (via the bundled rompatch\FRLG - IronMob.ips), then create a Tracker "Generate ROM each
+	-- time" New Run profile pointed at that ROM + our randomizer jar + the FRLG Kaizo ruleset, so
+	-- chat can start battling immediately. Uses ONLY public Tracker globals (QuickloadScreen /
+	-- Options / Main / FileManager / ExternalUI) - no Tracker source is modified. Idempotent: a
+	-- cheap startup check skips everything once set up, and silently re-creates the profile if
+	-- only that goes missing. Ported from the IronmonVS extension's setup flow.
+
+	self.Setup = {
+		patchedName = "FRLG - IronMob.gba", -- base ROM we write (the jar randomizes it each seed)
+		stateFile   = "setup_state.json",   -- our tiny idempotency record
+		rulesName   = "FRLG Kaizo.rnqs",     -- ships with the Tracker
+		profileName = "IronMob",
+		version     = 1,           -- bump when the base ROM / IPS changes, to force a re-patch
+		romSize     = 16777216,    -- 16MB FireRed
+		baseAdler   = 0x2D0FB28A,  -- adler32 of the correctly-patched IronMob base ROM
+		sourceAdler = 0x57240B31,  -- adler32 of the expected clean FireRed (USA) source
+		ready       = false,       -- set true by self.checkSetup() once everything is in place
+		warnActive  = false,       -- show the setup banner
+		needsUpdate = false,       -- true when a PRIOR setup is now out of date (re-patch, not first-time)
+		Button      = { x = 6, y = 23, w = 150, h = 13 },
+	}
+	self.SetupPaths = {}   -- absolute paths, resolved in self.startup()
+
+	-- Adler-32 of a binary string. Only +/% (no bitwise lib, not guaranteed across Bizhawk Lua
+	-- versions). 256-byte chunks stay under Adler's NMAX (5552), so deferring the modulo to each
+	-- chunk boundary is safe.
+	local function adler32(s)
+		local MOD = 65521
+		local a, b = 1, 0
+		local len = #s
+		local i = 1
+		local sbyte = string.byte
+		while i <= len do
+			local j = i + 255
+			if j > len then j = len end
+			local t = { sbyte(s, i, j) }
+			for k = 1, #t do
+				a = a + t[k]
+				b = b + a
+			end
+			a = a % MOD
+			b = b % MOD
+			i = j + 1
+		end
+		return b * 65536 + a
+	end
+
+	local function readWholeFile(path)
+		local f = io.open(path, "rb")
+		if not f then return nil end
+		local data = f:read("*a")
+		f:close()
+		return data
+	end
+
+	local function writeWholeFile(path, data)
+		local f = io.open(path, "wb")
+		if not f then return false end
+		f:write(data)
+		f:close()
+		return true
+	end
+
+	-- Cheap size lookup (no full read): seek to end.
+	local function fileSizeOf(path)
+		local f = io.open(path, "rb")
+		if not f then return nil end
+		local sz = f:seek("end")
+		f:close()
+		return sz
+	end
+
+	-- Apply a standard IPS patch (binary string) to a source ROM (binary string). Lua strings are
+	-- immutable, so build the output as a list of unchanged spans + patched bytes and concat once
+	-- (O(n)); the shipped patch's records are in-order and non-overlapping (verified). Returns the
+	-- patched string, or nil + reason.
+	local function applyIps(src, ips)
+		if string.sub(ips, 1, 5) ~= "PATCH" then return nil, "not an IPS file" end
+		local sbyte, ssub = string.byte, string.sub
+		local parts, np = {}, 0
+		local cursor = 0
+		local srcLen, ipsLen = #src, #ips
+		local i = 6
+		while true do
+			if i + 2 > ipsLen then return nil, "truncated IPS (no EOF)" end
+			local b1, b2, b3 = sbyte(ips, i, i + 2)
+			if b1 == 0x45 and b2 == 0x4F and b3 == 0x46 then break end  -- "EOF"
+			local off = b1 * 65536 + b2 * 256 + b3
+			i = i + 3
+			local s1, s2 = sbyte(ips, i, i + 1)
+			local size = s1 * 256 + s2
+			i = i + 2
+			local data
+			if size == 0 then                       -- RLE record
+				local r1, r2 = sbyte(ips, i, i + 1)
+				local rle = r1 * 256 + r2
+				i = i + 2
+				local v = ssub(ips, i, i)
+				i = i + 1
+				data = string.rep(v, rle)
+			else
+				data = ssub(ips, i, i + size - 1)
+				i = i + size
+			end
+			if off > cursor then
+				np = np + 1; parts[np] = ssub(src, cursor + 1, off)   -- untouched span [cursor, off)
+			elseif off < cursor then
+				return nil, "overlapping IPS records"
+			end
+			np = np + 1; parts[np] = data
+			cursor = off + #data
+		end
+		if cursor < srcLen then
+			np = np + 1; parts[np] = ssub(src, cursor + 1)            -- tail
+		end
+		return table.concat(parts)
+	end
+
+	-- Red "Set up IronMob" banner across the top of the game screen (matches the bridge-warning
+	-- style). The clickable button is hit-tested in self.inputCheckBizhawk.
+	local function drawSetupBanner()
+		if not Main.IsOnBizhawk() then return end
+		local w = Constants.SCREEN.WIDTH
+		gui.drawRectangle(0, 0, w, 38, 0xFFCC0000, 0xFFCC0000)
+		if self.Setup.needsUpdate then
+			Drawing.drawText(6, 2, "IronMob updated - ROM out of date", 0xFFFFFFFF, 0xFF000000)
+			Drawing.drawText(6, 12, "Re-patch to play the newest version", 0xFFFFFF00, 0xFF000000)
+		else
+			Drawing.drawText(6, 2, "Welcome to IronMob!", 0xFFFFFFFF, 0xFF000000)
+			Drawing.drawText(6, 12, "One-time setup required", 0xFFFFFF00, 0xFF000000)
+		end
+		local b = self.Setup.Button
+		gui.drawRectangle(b.x, b.y, b.w, b.h, 0xFF000000, 0xFFFFFFFF)
+		Drawing.drawText(b.x + 4, b.y + 2, self.Setup.needsUpdate and "Update ROM" or "Set up IronMob", 0xFFCC0000)
+	end
+
+	-- Our tiny idempotency record: { version, baseAdler, rom, size, guid }. baseAdler pins the
+	-- exact patched ROM this install was set up against, so a new extension version that ships a
+	-- different base ROM is detected even if the version number were somehow left unchanged.
+	function self.readSetupState()
+		local st = nil
+		pcall(function()
+			if FileManager.fileExists and not FileManager.fileExists(self.SetupPaths.state) then return end
+			if FileManager.decodeJsonFile then st = FileManager.decodeJsonFile(self.SetupPaths.state) end
+		end)
+		if type(st) == "table" then return st end
+		return nil
+	end
+
+	function self.writeSetupState(guid)
+		local st = { version = self.Setup.version, baseAdler = self.Setup.baseAdler,
+		             rom = self.SetupPaths.rom, size = self.Setup.romSize, guid = guid }
+		pcall(function() FileManager.encodeToJsonFile(self.SetupPaths.state, st) end)
+	end
+
+	-- Create (or, if guid is given, update in place) a Generate-mode New Run profile and set it
+	-- active. addUpdateProfile persists NewRunProfiles.json, mirrors the paths into Options.FILES,
+	-- flips Generate_ROM_each_time, and saves settings - all Tracker-native.
+	function self.createProfile(jarPath, romPath, rulesPath, guid)
+		local ok, res = pcall(function()
+			if type(QuickloadScreen) ~= "table" or type(QuickloadScreen.IProfile) ~= "table"
+				or type(QuickloadScreen.addUpdateProfile) ~= "function" then
+				return nil
+			end
+			local gen = (QuickloadScreen.Modes and QuickloadScreen.Modes.GENERATE) or "Generate"
+			local profile = QuickloadScreen.IProfile:new({
+				Name = self.Setup.profileName,
+				Mode = gen,
+				GameVersion = "firered",
+				Paths = { Jar = jarPath, Rom = romPath, Settings = rulesPath },
+			})
+			if guid and guid ~= "" then profile.GUID = guid end
+			if Options and Options["Game Over condition"] then
+				profile.GameOverCondition = Options["Game Over condition"]
+			end
+			if not QuickloadScreen.addUpdateProfile(profile, true) then return nil end
+			return profile.GUID
+		end)
+		if ok then return res end
+		return nil
+	end
+
+	-- Click handler: the bare Bizhawk file dialog has no title/description, so first show a small
+	-- modal explaining WHAT to pick (your own clean FireRed ROM), then run the patch flow from its
+	-- button. Falls back to opening the picker directly if the Tracker form API is unavailable.
+	function self.runSetup()
+		if not Main.IsOnBizhawk() then return end
+
+		-- Default the file dialog to the folder of the currently-open ROM.
+		local defaultDir = ""
+		pcall(function()
+			local loaded = FileManager.getLoadedRomPath and FileManager.getLoadedRomPath()
+			if loaded and loaded ~= "" and FileManager.getPathParts then
+				defaultDir = (FileManager.getPathParts(loaded)) or ""
+			end
+		end)
+
+		local shown = pcall(function()
+			local X = 20
+			local form = ExternalUI.BizForms.createForm("IronMob First-Time Setup", 440, 180, 60, 30)
+			form:createLabel("Choose your own Pokemon FireRed (USA) ROM.", X, 18)
+			form:createLabel("IronMob patches a COPY of it to build the game ROM chat", X, 40)
+			form:createLabel("battles on. Your original FireRed file is not changed.", X, 58)
+			form:createButton("Choose FireRed ROM...", X, 98, function()
+				ExternalUI.BizForms.destroyForm()
+				self.patchFromRom(defaultDir)
+			end, 170, 26)
+			form:createButton("Cancel", X + 190, 98, function()
+				ExternalUI.BizForms.destroyForm()
+			end, 90, 26)
+		end)
+		if not shown then self.patchFromRom(defaultDir) end   -- no form API -> straight to picker
+	end
+
+	-- Ask for the FireRed ROM, then patch -> verify -> save base ROM -> create profile.
+	function self.patchFromRom(defaultDir)
+		local S, P = self.Setup, self.SetupPaths
+
+		local romPath = ""
+		pcall(function()
+			romPath = ExternalUI.BizForms.openFilePrompt("SELECT YOUR FIRERED ROM", defaultDir or "",
+				"GBA ROM (*.gba)|*.gba|All files (*.*)|*.*") or ""
+		end)
+		if romPath == "" then return end   -- cancelled
+
+		local src = readWholeFile(romPath)
+		if not src then gui.addmessage("IronMob: couldn't read that ROM."); return end
+		if #src ~= S.romSize then
+			gui.addmessage("IronMob: that's not a 16MB GBA ROM - pick your FireRed ROM.")
+			return
+		end
+		if adler32(src) ~= S.sourceAdler then
+			gui.addmessage("IronMob: that's not the standard clean FireRed (USA) ROM.")
+			return
+		end
+
+		local ipsBytes = readWholeFile(P.ips)
+		if not ipsBytes then gui.addmessage("IronMob: missing rompatch/FRLG - IronMob.ips."); return end
+
+		local patched, perr = applyIps(src, ipsBytes)
+		if not patched then gui.addmessage("IronMob: patch failed (" .. tostring(perr) .. ")."); return end
+		if adler32(patched) ~= S.baseAdler then
+			gui.addmessage("IronMob: patched ROM checksum mismatch - is your FireRed clean?")
+			return
+		end
+		if not writeWholeFile(P.rom, patched) then
+			gui.addmessage("IronMob: couldn't save the patched ROM."); return
+		end
+
+		if P.rules == "" or not FileManager.fileExists(P.rules) then
+			gui.addmessage("IronMob: couldn't find the FRLG Kaizo ruleset in the Tracker.")
+			return
+		end
+
+		local prev = self.readSetupState()
+		local guid = self.createProfile(P.jar, P.rom, P.rules, prev and prev.guid)
+		if not guid then gui.addmessage("IronMob: couldn't create the Tracker profile."); return end
+
+		self.writeSetupState(guid)
+		self.Setup.ready = true
+		self.Setup.warnActive = false
+		logToFile("First-time setup complete: patched ROM + created profile " .. tostring(guid))
+		gui.addmessage("IronMob is ready! Press A + B + Start to load your first seed.")
+	end
+
+	-- Startup idempotency check (cheap: state file + fileExists + size). Self-heals the profile
+	-- silently if only it went missing. No prompting when already set up.
+	function self.checkSetup()
+		self.Setup.ready = false
+		self.Setup.warnActive = false
+		self.Setup.needsUpdate = false
+		if not Main.IsOnBizhawk() then return end   -- BizHawk-only flow
+
+		local P = self.SetupPaths
+		local st = self.readSetupState()
+		local romPresent = FileManager.fileExists(P.rom) and (fileSizeOf(P.rom) == self.Setup.romSize)
+		-- Up to date only if the recorded version AND the recorded base-ROM checksum both match
+		-- what this extension version ships. (baseAdler absent = state written by an older build,
+		-- before checksum-pinning; fall back to the version check so we don't nag early adopters.)
+		local adlerOk = (st == nil) or (st.baseAdler == nil) or (st.baseAdler == self.Setup.baseAdler)
+		local romOk = st and st.version == self.Setup.version and adlerOk and romPresent
+
+		-- Adopt an already-present base ROM when there's no state yet (upgrading an existing
+		-- install). Verify its checksum once so we only adopt - and record - a correct, current
+		-- ROM, and only if the jar + ruleset are in place so the profile we create is valid.
+		if not romOk and romPresent and not st
+			and FileManager.fileExists(P.jar) and P.rules ~= "" and FileManager.fileExists(P.rules) then
+			local data = readWholeFile(P.rom)
+			if data and adler32(data) == self.Setup.baseAdler then
+				romOk = true
+			end
+		end
+
+		if romOk then
+			local haveProfile = false
+			pcall(function()
+				haveProfile = st and st.guid and type(QuickloadScreen) == "table"
+					and type(QuickloadScreen.Profiles) == "table"
+					and QuickloadScreen.Profiles[st.guid] ~= nil
+			end)
+			if not haveProfile then
+				local guid = self.createProfile(P.jar, P.rom, P.rules, st and st.guid)
+				if guid then self.writeSetupState(guid) end
+			end
+			self.Setup.ready = true
+			return
+		end
+		-- Setup needed. If a prior setup exists but is now out of date (version/checksum bump, or
+		-- the base ROM went missing), frame it as a re-patch rather than a first-time setup.
+		self.Setup.needsUpdate = (st ~= nil)
+		self.Setup.warnActive = true
+	end
+	-- =================== END FIRST-TIME SETUP =========================================
+
 	function self.startup()
 		bridgeFolder = FileManager.getCustomFolderPath() .. "IronMob" .. FileManager.slash
 		outboxPath = bridgeFolder .. "bridge_outbox.json"
@@ -1168,6 +1484,22 @@ local function IronMobBridge()
 
 		-- Create folder if needed
 		os.execute('mkdir "' .. bridgeFolder .. '" 2>nul')
+
+		-- First-time setup paths (see the FIRST-TIME SETUP section). The base ROM, IPS patch and
+		-- state file live in the extension folder; the ruleset ships with the Tracker.
+		self.SetupPaths = {
+			ips   = bridgeFolder .. "rompatch" .. FileManager.slash .. "FRLG - IronMob.ips",
+			jar   = bridgeFolder .. "randomizer" .. FileManager.slash .. "FRLG Ironmob Randomizer.jar",
+			rom   = bridgeFolder .. self.Setup.patchedName,
+			state = bridgeFolder .. self.Setup.stateFile,
+			rules = "",
+		}
+		pcall(function()
+			if FileManager.Folders and FileManager.Folders.TrackerCode and FileManager.prependDir then
+				self.SetupPaths.rules = FileManager.prependDir(FileManager.Folders.TrackerCode
+					.. FileManager.slash .. "RandomizerSettings" .. FileManager.slash .. self.Setup.rulesName)
+			end
+		end)
 
 		-- Append to existing log with session separator (preserves history across restarts)
 		local lf = io.open(logPath, "a")
@@ -1218,6 +1550,11 @@ local function IronMobBridge()
 		-- Tell the server to clear any stale battle data from a previous session
 		queueMessage({type = "clear_pokemon"})
 		logToFile("Startup: initialized EWRAM buffers, sent lua_hello + clear_pokemon")
+
+		-- First-time setup: patch the player's ROM + create the Quickload profile if needed.
+		-- Guarded so a setup hiccup can never block the rest of the extension from loading.
+		pcall(self.checkSetup)
+		logToFile("Setup check: ready=" .. tostring(self.Setup.ready) .. " needsSetup=" .. tostring(self.Setup.warnActive))
 
 		console.log("IronMob Bridge started")
 	end
@@ -1401,15 +1738,19 @@ local function IronMobBridge()
 
 	-- Write countdown timer to EWRAM so the ROM displays "Waiting for [name] (Xs)" natively
 	function self.afterRedraw()
-		-- Bridge-not-running warning banner (drawn over the game screen)
+		-- First-time setup is the most fundamental problem (can't play at all), so its banner
+		-- takes precedence over the bridge-not-running warning.
+		local setupBanner = self.Setup.warnActive and not self.Setup.ready
 		updateBridgeWarning()
-		if BridgeWarn.active then
+		if setupBanner then
+			pcall(drawSetupBanner)
+		elseif BridgeWarn.active then
 			drawBridgeWarning()
 		end
 		-- Current/next trainer names over the tracker's carousel strip
 		pcall(drawQueueDisplay)
 		-- Ready-check indicator (bottom-left of the game screen)
-		if ReadyWait.active and not BridgeWarn.active then
+		if ReadyWait.active and not BridgeWarn.active and not setupBanner then
 			pcall(drawReadyWait)
 		end
 
@@ -1432,7 +1773,8 @@ local function IronMobBridge()
 	-- coordinate space the Tracker uses for mouse input, so the hit-test
 	-- matches what's drawn on the game screen.
 	function self.inputCheckBizhawk()
-		if not BridgeWarn.active then
+		local setupBanner = self.Setup.warnActive and not self.Setup.ready
+		if not setupBanner and not BridgeWarn.active then
 			BridgeWarn.mouseWasDown = false
 			return
 		end
@@ -1442,9 +1784,12 @@ local function IronMobBridge()
 		if down and not BridgeWarn.mouseWasDown then
 			local x = mouseInput["X"]
 			local y = mouseInput["Y"] + Constants.SCREEN.UP_GAP
-			local b = WarnButton
-			if x >= b.x and x <= b.x + b.w and y >= b.y and y <= b.y + b.h then
-				launchBridge()
+			local function hit(b) return x >= b.x and x <= b.x + b.w and y >= b.y and y <= b.y + b.h end
+			-- The setup banner takes precedence over the bridge warning (same as drawing).
+			if setupBanner then
+				if hit(self.Setup.Button) then pcall(self.runSetup) end
+			elseif BridgeWarn.active then
+				if hit(WarnButton) then launchBridge() end
 			end
 		end
 		BridgeWarn.mouseWasDown = down
